@@ -1,0 +1,531 @@
+function.php
+
+
+<?php
+use PHPMailer\PHPMailer\PHPMailer;
+use PHPMailer\PHPMailer\Exception;
+
+require __DIR__ . '/../PHPMailer-master/src/Exception.php';
+require __DIR__ . '/../PHPMailer-master/src/PHPMailer.php';
+require __DIR__ . '/../PHPMailer-master/src/SMTP.php';
+
+
+function getAllTasks(): array {
+    $file = __DIR__ . '/tasks.txt';
+    if (!file_exists($file)) return [];
+
+    $data = file_get_contents($file);
+    return json_decode($data, true) ?? [];
+}
+
+function saveAllTasks(array $tasks): void {
+    $file = __DIR__ . '/tasks.txt';
+    file_put_contents($file, json_encode($tasks, JSON_PRETTY_PRINT));
+}
+
+function addTask(string $task_name): bool {
+    $tasks = getAllTasks();
+
+    foreach ($tasks as $task) {
+        if (strcasecmp($task['name'], $task_name) === 0) return false;
+    }
+
+    $tasks[] = [
+        'id' => uniqid(),
+        'name' => $task_name,
+        'completed' => false
+    ];
+
+    saveAllTasks($tasks);
+    return true;
+}
+
+function markTaskAsCompleted(string $task_id, bool $is_completed): bool {
+    $tasks = getAllTasks();
+    $found = false;
+
+    foreach ($tasks as &$task) {
+        if ($task['id'] === $task_id) {
+            $task['completed'] = $is_completed;
+            $found = true;
+            break;
+        }
+    }
+
+    saveAllTasks($tasks);
+    return $found;
+}
+
+function deleteTask(string $task_id): bool {
+    $tasks = getAllTasks();
+    $newTasks = array_filter($tasks, fn($task) => $task['id'] !== $task_id);
+
+    if (count($newTasks) === count($tasks)) return false;
+
+    saveAllTasks(array_values($newTasks));
+    return true;
+}
+
+
+function generateVerificationCode(): string {
+    return str_pad(strval(random_int(0, 999999)), 6, '0', STR_PAD_LEFT);
+}
+
+function subscribeEmail(string $email): bool {
+    $file = __DIR__ . '/pending_subscriptions.txt';
+
+    $code = generateVerificationCode();
+    $pending = file_exists($file) ? json_decode(file_get_contents($file), true) : [];
+
+    $pending[$email] = [
+        'code' => $code,
+        'timestamp' => time()
+    ];
+
+    file_put_contents($file, json_encode($pending, JSON_PRETTY_PRINT));
+
+    $verification_link = "http://localhost/task-scheduler-SnehaMahajan07/src/verify.php?email=" . urlencode($email) . "&code=" . urlencode($code);
+
+    $subject = "Verify subscription to Task Planner";
+    $body = "
+        <p>Click the link below to verify your subscription to Task Planner:</p>
+        <p><a id='verification-link' href='$verification_link'>Verify Subscription</a></p>
+    ";
+
+    $headers = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: no-reply@example.com\r\n";
+
+    return mail($email, $subject, $body, $headers);
+}
+
+
+
+function verifySubscription(string $email, string $code): bool {
+    $pending_file = __DIR__ . '/pending_subscriptions.txt';
+    $subscribers_file = __DIR__ . '/subscribers.txt';
+
+    // Load pending
+    $pending = file_exists($pending_file) ? json_decode(file_get_contents($pending_file), true) : [];
+
+    // ✅ Check if email exists and code matches
+    if (!isset($pending[$email]) || $pending[$email]['code'] !== $code) {
+        return false;
+    }
+
+    // ✅ Remove from pending
+    unset($pending[$email]);
+    file_put_contents($pending_file, json_encode($pending, JSON_PRETTY_PRINT));
+
+    // ✅ Add to subscribers
+    $subscribers = file_exists($subscribers_file) ? json_decode(file_get_contents($subscribers_file), true) : [];
+    if (!is_array($subscribers)) $subscribers = [];
+
+    if (!in_array($email, $subscribers)) {
+        $subscribers[] = $email;
+        file_put_contents($subscribers_file, json_encode($subscribers, JSON_PRETTY_PRINT));
+    }
+
+    return true;
+}
+
+
+function unsubscribeEmail(string $email): bool {
+    $subscribers_file = __DIR__ . '/subscribers.txt';
+    $subscribers = file_exists($subscribers_file) ? json_decode(file_get_contents($subscribers_file), true) : [];
+
+    $filtered = array_filter($subscribers, fn($e) => $e !== $email);
+
+    if (count($filtered) === count($subscribers)) return false;
+
+    file_put_contents($subscribers_file, json_encode(array_values($filtered), JSON_PRETTY_PRINT));
+    return true;
+}
+
+function sendTaskReminders(): void {
+    $subscribers_file = __DIR__ . '/subscribers.txt';
+    $subscribers = file_exists($subscribers_file) ? json_decode(file_get_contents($subscribers_file), true) : [];
+
+    $pending_tasks = array_filter(getAllTasks(), fn($t) => !$t['completed']);
+
+    foreach ($subscribers as $email) {
+        sendTaskEmail($email, $pending_tasks);
+    }
+}
+
+function sendTaskEmail(string $email, array $pending_tasks): bool {
+    $subject = 'Task Planner - Pending Tasks Reminder';
+
+    $body = "
+    <h2>Pending Tasks Reminder</h2>
+    <p>Here are the current pending tasks:</p>
+    <ul>";
+
+    foreach ($pending_tasks as $task) {
+        $body .= "<li>" . htmlspecialchars($task['name']) . "</li>";
+    }
+
+    $unsubscribe_link = "http://localhost/task-scheduler-SnehaMahajan07/src/unsubscribe.php?email=" . urlencode($email);
+    $body .= "</ul><p><a id='unsubscribe-link' href='$unsubscribe_link'>Unsubscribe from notifications</a></p>";
+
+    // Email headers
+    $headers = "MIME-Version: 1.0\r\n";
+    $headers .= "Content-Type: text/html; charset=UTF-8\r\n";
+    $headers .= "From: no-reply@example.com\r\n";
+
+    return mail($email, $subject, $body, $headers);
+}
+
+
+_____________________________________________________________
+
+
+
+index.php
+
+
+
+<?php
+require_once 'functions.php';
+
+// Handle Task Add
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['task-name'])) {
+    $taskName = trim($_POST['task-name']);
+    if ($taskName !== '') {
+        addTask($taskName);
+    }
+}
+
+// Handle Task Completion/Deletion
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['action']) && isset($_POST['task-id'])) {
+    $taskId = $_POST['task-id'];
+    if ($_POST['action'] === 'toggle') {
+        markTaskAsCompleted($taskId, $_POST['status'] === '1');
+    } elseif ($_POST['action'] === 'delete') {
+        deleteTask($taskId);
+    }
+}
+
+// Handle Subscription
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['email'])) {
+    $email = trim($_POST['email']);
+    if ($email !== '') {
+        subscribeEmail($email);
+    }
+}
+
+$tasks = getAllTasks();
+?>
+
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Task Planner</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background: #f4f4f4;
+            padding: 40px;
+        }
+
+        h1 {
+            text-align: center;
+            color: #333;
+        }
+
+        .container {
+            max-width: 700px;
+            margin: auto;
+            background: white;
+            padding: 30px;
+            border-radius: 8px;
+            box-shadow: 0px 0px 15px rgba(0, 0, 0, 0.1);
+        }
+
+        form {
+            margin-bottom: 20px;
+        }
+
+        input[type="text"],
+        input[type="email"] {
+            width: 75%;
+            padding: 10px;
+            margin-right: 10px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+        }
+
+        button {
+            padding: 10px 15px;
+            background-color: #28a745;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+
+        button.delete-task {
+            background-color: #dc3545;
+        }
+
+        ul {
+            list-style-type: none;
+            padding: 0;
+        }
+
+        li.task-item {
+            padding: 10px;
+            border-bottom: 1px solid #eee;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .unsubscribe-link {
+            text-align: center;
+            margin-top: 25px;
+        }
+
+        .unsubscribe-link a {
+            color: #dc3545;
+            text-decoration: none;
+            font-weight: bold;
+        }
+
+        .unsubscribe-link a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container">
+        <h1>📋 Task Planner</h1>
+
+        <!-- Add Task Form -->
+        <form method="POST" action="">
+            <input type="text" name="task-name" placeholder="Enter new task" required>
+            <button type="submit">Add Task</button>
+        </form>
+
+        <!-- Link to Verify Email -->
+<div style="margin-top: 20px;">
+    <p>Already subscribed but not verified?</p>
+    <a href="verify.php" style="color: #007BFF; text-decoration: none;">🔐 Click here to verify your email</a>
+</div>
+
+
+        <!-- Tasks List -->
+        <ul>
+            <?php foreach ($tasks as $task): ?>
+                <li class="task-item">
+                    <form method="POST" style="display:inline;">
+                        <input type="hidden" name="task-id" value="<?= $task['id'] ?>">
+                        <input type="hidden" name="action" value="toggle">
+                        <input type="hidden" name="status" value="<?= $task['completed'] ? '0' : '1' ?>">
+                        <input type="checkbox" onchange="this.form.submit()" <?= $task['completed'] ? 'checked' : '' ?>>
+                    </form>
+                    <span><?= htmlspecialchars($task['name']) ?></span>
+                    <form method="POST" style="display:inline;">
+                        <input type="hidden" name="task-id" value="<?= $task['id'] ?>">
+                        <input type="hidden" name="action" value="delete">
+                        <button type="submit" class="delete-task">Delete</button>
+                    </form>
+                </li>
+            <?php endforeach; ?>
+        </ul>
+
+        <!-- Subscription Form -->
+        <form method="POST" action="">
+            <input type="email" name="email" placeholder="Enter your email to subscribe" required>
+            <button type="submit">Subscribe</button>
+        </form>
+
+        <!-- Unsubscribe Link -->
+        <div class="unsubscribe-link">
+            <a href="unsubscribe.php">Unsubscribe from Emails</a>
+        </div>
+    </div>
+</body>
+
+</html>
+____________________________________________________________
+
+uns.php
+
+
+<?php
+require_once 'functions.php';
+
+$message = '';
+
+if ($_SERVER["REQUEST_METHOD"] === "POST" && isset($_POST['email'])) {
+    $email = trim($_POST['email']);
+    if ($email !== '') {
+        if (unsubscribeEmail($email)) {
+            $message = "You have been unsubscribed successfully.";
+        } else {
+            $message = "Email not found or already unsubscribed.";
+        }
+    } else {
+        $message = "Please enter a valid email.";
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html>
+
+<head>
+    <title>Unsubscribe from Task Updates</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #eef2f7;
+            text-align: center;
+            padding-top: 100px;
+        }
+        form {
+            background-color: white;
+            display: inline-block;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        input[type="email"] {
+            padding: 10px;
+            width: 250px;
+            margin: 10px 0;
+            border-radius: 5px;
+            border: 1px solid #ccc;
+        }
+        button {
+            padding: 10px 20px;
+            background-color: #d9534f;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        .message {
+            margin-top: 20px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+
+<body>
+
+    <form method="POST" action="">
+        <h2>Unsubscribe from Task Updates</h2>
+        <input type="email" name="email" placeholder="Enter your email" required>
+        <br>
+        <button type="submit">Unsubscribe</button>
+        <?php if ($message): ?>
+            <div class="message"><?= htmlspecialchars($message) ?></div>
+        <?php endif; ?>
+    </form>
+
+</body>
+
+</html>
+_____________________________________________________________
+
+verify.php
+
+<?php
+require_once 'functions.php';
+
+$message = '';
+
+if ($_SERVER["REQUEST_METHOD"] === "POST") {
+    $email = trim($_POST['email'] ?? '');
+    $code = trim($_POST['code'] ?? '');
+
+    if ($email && $code) {
+        if (verifySubscription($email, $code)) {
+            $message = "✅ Email verified successfully!";
+        } else {
+            $message = "❌ Invalid verification code or email.";
+        }
+    } else {
+        $message = "⚠️ Please enter both email and verification code.";
+    }
+}
+?>
+
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Verify Email - Task Planner</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            padding: 50px;
+            background-color: #f2f2f2;
+        }
+        .verify-container {
+            background: white;
+            padding: 30px;
+            max-width: 400px;
+            margin: auto;
+            border-radius: 12px;
+            box-shadow: 0 0 10px rgba(0,0,0,0.1);
+        }
+        input[type="email"], input[type="text"] {
+            width: 100%;
+            padding: 12px;
+            margin-top: 8px;
+            margin-bottom: 16px;
+            border: 1px solid #ccc;
+            border-radius: 6px;
+        }
+        button {
+            padding: 10px 16px;
+            background-color: #007BFF;
+            color: white;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+        }
+        button:hover {
+            background-color: #0056b3;
+        }
+        .message {
+            margin-top: 20px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+
+<div class="verify-container">
+    <h2>Verify Your Email</h2>
+    <form method="POST" action="">
+        <label for="email">Your Email:</label>
+        <input type="email" name="email" id="email" required>
+
+        <label for="code">Verification Code:</label>
+        <input type="text" name="code" id="code" required>
+
+        <button type="submit">Verify</button>
+    </form>
+
+    <?php if ($message): ?>
+        <div class="message"><?= htmlspecialchars($message) ?></div>
+    <?php endif; ?>
+</div>
+
+</body>
+</html>
+_________________________________________________________
+
+
+cron.php
+
+<?php
+require_once 'functions.php';
+
+// Send task reminders to all subscribers.
+sendTaskReminders();
