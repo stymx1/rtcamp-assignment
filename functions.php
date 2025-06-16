@@ -1,5 +1,5 @@
 <?php
-
+ // Generate verification code
 function getAllTasks(): array {
     $file = __DIR__ . '/tasks.txt';
     if (!file_exists($file)) return [];
